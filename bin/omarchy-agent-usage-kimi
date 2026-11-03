@@ -1,0 +1,301 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Kimi Code subscription usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Read Kimi website quotas, renewing its session independently of Kimi Code."""
+
+import argparse
+import json
+import math
+import os
+import socket
+import struct
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Also works when loaded by the test runner rather than executed as a script.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kimi_browser_session import claims
+from kimi_web_session import access_token, SessionError, LOGIN_HELP
+
+
+DEFAULT_BASE = "https://api.kimi.com/coding/v1"
+OFFICIAL_BASES = {DEFAULT_BASE, "https://api.kimi.ai/coding/v1"}
+MONTHLY_ENDPOINTS = {
+  base + "/usages": "https://www.kimi." + region
+    + "/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats"
+  for base, region in ((DEFAULT_BASE, "com"), ("https://api.kimi.ai/coding/v1", "ai"))
+}
+AUTH_HELP = LOGIN_HELP
+WINDOWS = (
+  ("limit_5h", "Session (5-hour)", "Session"),
+  ("limit_7d", "Weekly (7-day)", "Weekly"),
+  ("limit_month_total", "Monthly total (Kimi + Code)", "Monthly total"),
+  ("limit_month_code", "Monthly Code (share of total)", "Monthly Code share"),
+)
+
+
+class UsageError(Exception):
+  pass
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    return None
+
+
+def read_login(home):
+  config_path = home / "config.toml"
+  config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+  provider = config.get("providers", {}).get("managed:kimi-code", {})
+  base = str(provider.get("base_url", DEFAULT_BASE)).rstrip("/")
+  if base not in OFFICIAL_BASES:
+    raise UsageError("Unsupported Kimi endpoint; credentials were not sent.")
+  oauth = provider.get("oauth", {})
+  if oauth.get("storage", "file") != "file":
+    raise UsageError("Kimi keyring credentials are not supported by this collector.")
+  # Official toolkit.ts resolves oauth/<name> to credentials/<name>.json.
+  key = oauth.get("key", "oauth/kimi-code")
+  if not isinstance(key, str):
+    raise UsageError("Invalid Kimi credential reference.")
+  name = key.removeprefix("oauth/")
+  if not name or name.startswith(".") or "/" in name or "\\" in name:
+    raise UsageError("Invalid Kimi credential reference.")
+  path = home / "credentials" / (name + ".json")
+  if not path.exists():
+    raise UsageError(AUTH_HELP)
+  credential = json.loads(path.read_text())
+  token = credential.get("access_token")
+  if not isinstance(token, str) or not token.strip():
+    raise UsageError(AUTH_HELP)
+  return base + "/usages", token
+
+
+def quota_limits(payload):
+  if not isinstance(payload, dict) or not isinstance(payload.get("usages"), dict):
+    raise UsageError("Kimi returned an unrecognized usage response.")
+  result = []
+  for key, label, title in WINDOWS:
+    entry = payload["usages"].get(key)
+    if not isinstance(entry, dict):
+      continue
+    raw = entry.get("used_ratio")
+    if isinstance(raw, bool) or raw is None or raw == "":
+      continue
+    try:
+      ratio = float(raw)
+    except (ValueError, TypeError):
+      continue
+    if not math.isfinite(ratio) or ratio < 0:
+      continue
+    reset = entry.get("reset_time")
+    result.append({"label": label, "title": title, "percent": ratio,
+                   "resetsAt": reset if isinstance(reset, str) else ""})
+  if not result:
+    raise UsageError("Kimi returned no subscription quota windows.")
+  return result
+
+
+def monthly_limit(payload):
+  balance = payload.get("subscriptionBalance") if isinstance(payload, dict) else None
+  if not isinstance(balance, dict):
+    raise UsageError("Kimi returned no monthly membership quota.")
+  if balance.get("feature") not in (None, "FEATURE_OMNI") or balance.get("type") not in (None, "SUBSCRIPTION"):
+    raise UsageError("Kimi returned no monthly membership quota.")
+  # amountUsedRatio is the shared monthly pool; kimiCodeUsedRatio is a
+  # contribution to it, not the total monthly allowance.
+  return quota_limits({"usages": {"limit_month_total": {
+    "used_ratio": balance.get("amountUsedRatio"),
+    "reset_time": balance.get("expireTime"),
+  }}})[0]
+
+
+def monthly_limits(payload):
+  total = monthly_limit(payload)
+  balance = payload["subscriptionBalance"]
+  try:
+    code = quota_limits({"usages": {"limit_month_code": {
+      "used_ratio": balance.get("kimiCodeUsedRatio"),
+      "reset_time": total["resetsAt"],
+    }}})[0]
+  except UsageError:
+    return [total]
+  # Matches the website's non-Code share; both use the full monthly pool.
+  kimi = {"label": "Monthly Kimi (non-Code share of total)",
+          "title": "Monthly Kimi share",
+          "percent": max(total["percent"] - code["percent"], 0),
+          "resetsAt": total["resetsAt"]}
+  return [total, kimi, code]
+
+
+def web_headers(origin, token):
+  headers = {
+    "Content-Type": "application/json", "Origin": origin,
+    "Referer": origin + "/code/console", "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9", "connect-protocol-version": "1",
+    "x-language": "en-US", "x-msh-platform": "web", "r-timezone": "Asia/Hong_Kong",
+    "x-msh-version": "2.3.0",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+  }
+  try:
+    identity = claims(token)
+  except ValueError:
+    identity = {}
+  for header, key in (("x-msh-device-id", "device_id"), ("x-msh-session-id", "ssid"), ("x-traffic-id", "sub")):
+    value = identity.get(key)
+    if isinstance(value, str) and value:
+      headers[header] = value
+  return headers
+
+
+def post_json(url, body, headers):
+  request = urllib.request.Request(url, data=json.dumps(body, separators=(",", ":")).encode(), method="POST", headers=headers)
+  with urllib.request.build_opener(NoRedirect()).open(request, timeout=8) as response:
+    return json.load(response)
+
+
+def fetch_web(endpoint, token, method):
+  origin = MONTHLY_ENDPOINTS[endpoint].split("/apiv2/", 1)[0]
+  paths = {
+    "usage": ("kimi.gateway.billing.v1.BillingService/GetUsages", {"scope": ["FEATURE_CODING"]}),
+    "monthly": ("kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats", {}),
+  }
+  path, body = paths[method]
+  headers = web_headers(origin, token)
+  headers.update({"Authorization": "Bearer " + token, "Cookie": "kimi-auth=" + token})
+  return post_json(origin + "/apiv2/" + path, body, headers)
+
+
+def fetch_monthly(endpoint, token):
+  return monthly_limits(fetch_web(endpoint, token, "monthly"))
+
+
+def renew_web(origin, refresh_token, old_access):
+  if origin != "https://www.kimi.com":
+    raise UsageError("Automatic renewal is not verified for this Kimi region.")
+  payload = post_json("https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken",
+                      {"refresh_token": refresh_token}, web_headers(origin, old_access))
+  if not isinstance(payload, dict):
+    raise UsageError("Kimi returned an invalid renewed website session.")
+  # Protobuf JSON accepts both field spellings; the website decoder does too.
+  return {"access_token": payload.get("access_token", payload.get("accessToken")),
+          "refresh_token": payload.get("refresh_token", payload.get("refreshToken"))}
+
+
+def web_quota_limits(payload):
+  usages = payload.get("usages") if isinstance(payload, dict) else None
+  if not isinstance(usages, list):
+    raise UsageError("Kimi returned an unrecognized website usage response.")
+  usage = next((u for u in usages if isinstance(u, dict) and u.get("scope") == "FEATURE_CODING"), {})
+  windows = {"limit_7d": usage.get("detail")}
+  limits = usage.get("limits", [])
+  for limit in limits if isinstance(limits, list) else []:
+    if not isinstance(limit, dict):
+      continue
+    window = limit.get("window", {})
+    if not isinstance(window, dict):
+      continue
+    multiplier = {"TIME_UNIT_MINUTE": 1, "TIME_UNIT_HOUR": 60, "TIME_UNIT_DAY": 1440}.get(window.get("timeUnit"))
+    if multiplier and window.get("duration") in (5, 300) and window["duration"] * multiplier == 300:
+      windows["limit_5h"] = limit.get("detail")
+  parsed = {}
+  for key, detail in windows.items():
+    if not isinstance(detail, dict):
+      continue
+    # Protobuf counters can be strings or JSON integers. Missing is not zero.
+    def counter(value):
+      if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+      try:
+        return int(value)
+      except ValueError:
+        return None
+    maximum, used, remaining = (counter(detail.get(name)) for name in ("limit", "used", "remaining"))
+    if maximum is None or maximum <= 0:
+      continue
+    if used is None or used < 0:
+      used = maximum - remaining if remaining is not None and 0 <= remaining <= maximum else None
+    if used is not None:
+      reset = next((detail.get(k) for k in ("resetTime", "resetAt", "reset_time", "reset_at") if isinstance(detail.get(k), str)), "")
+      parsed[key] = {"used_ratio": used / maximum, "reset_time": reset}
+  return quota_limits({"usages": parsed})
+
+
+def web_login(endpoint, code_token, home):
+  origin = MONTHLY_ENDPOINTS[endpoint].split("/apiv2/", 1)[0]
+  return access_token(home, origin, code_token, lambda refresh, old: renew_web(origin, refresh, old))
+
+
+def error_help(error):
+  if isinstance(error, urllib.error.HTTPError):
+    return AUTH_HELP if error.code in (401, 403) else f"Kimi returned HTTP {error.code}. Try refreshing later."
+  if isinstance(error, (UsageError, SessionError)):
+    return str(error)
+  if isinstance(error, (urllib.error.URLError, TimeoutError, socket.timeout)):
+    return "Could not reach Kimi. Check the network and refresh."
+  return "Could not read Kimi website login or usage data. " + AUTH_HELP
+
+
+def collect(home):
+  record = {
+    "schemaVersion": 1, "id": "kimi", "name": "Kimi Code",
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": (home / "config.toml").exists() or (home / "credentials").is_dir(),
+    "hasLocalStats": False, "hasPromptStats": False,
+    "limits": [], "tierLabel": "", "usageStatusText": "", "authHelpText": "",
+  }
+  if not record["ready"]:
+    return record
+  errors = []
+  handled = (OSError, ValueError, TypeError, AttributeError, IndexError, KeyError, struct.error, UsageError, SessionError)
+  try:
+    endpoint, token = read_login(home)
+  except handled as exc:
+    record["usageStatusText"] = "Kimi usage unavailable"
+    record["authHelpText"] = error_help(exc)
+    return record
+  try:
+    web = web_login(endpoint, token, home)
+  except handled as exc:
+    errors.append(error_help(exc))
+  else:
+    for fetch in (lambda: web_quota_limits(fetch_web(endpoint, web, "usage")),
+                  lambda: fetch_monthly(endpoint, web)):
+      try:
+        record["limits"].extend(fetch())
+      except handled as exc:
+        errors.append(error_help(exc))
+  titles = {limit["title"] for limit in record["limits"]}
+  if not {"Session", "Weekly"}.issubset(titles):
+    try:
+      request = urllib.request.Request(endpoint, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+      with urllib.request.build_opener(NoRedirect()).open(request, timeout=8) as response:
+        fallback = quota_limits(json.load(response))
+      record["limits"].extend(limit for limit in fallback if limit["title"] not in titles)
+    except handled as exc:
+      errors.append(error_help(exc))
+  order = [title for _, _, title in WINDOWS]
+  order.insert(order.index("Monthly Code share"), "Monthly Kimi share")
+  record["limits"].sort(key=lambda limit: order.index(limit["title"]))
+  missing = {"Session", "Weekly", "Monthly total"} - {limit["title"] for limit in record["limits"]}
+  if missing:
+    record["usageStatusText"] = "Monthly quota unavailable" if missing == {"Monthly total"} else "Kimi usage partially unavailable" if record["limits"] else "Kimi usage unavailable"
+    record["authHelpText"] = " ".join(dict.fromkeys(errors)) or "Kimi did not return all quota windows."
+  return record
+
+
+def main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.parse_args()
+  home = Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code").expanduser()
+  print(json.dumps(collect(home), separators=(",", ":"), allow_nan=False))
+
+
+if __name__ == "__main__":
+  main()
