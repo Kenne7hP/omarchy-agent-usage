@@ -26,6 +26,10 @@ it is not a replacement for every subsequent upstream improvement.
 
 ## Requirements and compatibility
 
+**Windows is not currently supported.** A Windows tray application is feasible
+but remains a proposal. See the [Windows adaptation plan](docs/windows-adaptation.md)
+for reusable components, platform work and required real-device verification.
+
 - Omarchy **4.0.6** with its Quickshell shell and `qs.Commons` / `qs.Ui` components.
   Newer Omarchy versions have not been verified with this package.
 - Python **3.11+**, Bash, `jq`, and `libsnappy.so.1` (Arch's `snappy` package).

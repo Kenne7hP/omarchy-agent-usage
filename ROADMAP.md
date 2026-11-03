@@ -3,6 +3,7 @@
 ## Current phase
 
 First public package published and verified from a fresh GitHub clone.
+Windows adaptation is at the proposal stage; no Windows implementation exists.
 
 ## Done
 
@@ -33,6 +34,9 @@ First public package published and verified from a fresh GitHub clone.
 - Verified a fresh GitHub clone: all tracked bytes and executable modes matched
   the source package; all 55 synthetic tests passed with zero skips. Native
   plugin validation and Bash syntax checks also passed on the remote clone.
+- Documented the Windows feasibility assessment, suggested Python + PySide6
+  approach, platform changes and Windows acceptance criteria. README links to
+  the proposal and explicitly states that Windows is not currently supported.
 
 ## In progress
 
@@ -40,12 +44,17 @@ First public package published and verified from a fresh GitHub clone.
 
 ## Todo
 
+- Decide whether to implement the [Windows adaptation proposal](docs/windows-adaptation.md).
+  Before coding, define platform structure and dependencies; then validate Kimi
+  browser-session access, Codex invocation, tray behavior and packaging on Windows.
 - Verify full plugin enablement on an additional Omarchy installation. Remote
   cloning and native package validation are verified; publication did not replace
   the existing desktop plugin.
 
 ## Blockers and limits
 
+- Windows browser-session access, credential protection, process handling and
+  executable packaging have not been implemented or tested on Windows hardware.
 - Current desktop behavior is based on Omarchy 4.0.6; newer upstream versions
   already include Kimi and need a separate compatibility review.
 - Long-term concurrent Kimi browser/plugin token renewal remains unverified.
@@ -62,3 +71,7 @@ First public package published and verified from a fresh GitHub clone.
 - 2026-11-03: published package commit `9f5ae34` independently cloned from GitHub;
   all 29 tracked files and executable modes matched. All 55 tests, native plugin
   validation and Bash syntax checks passed. Public repository visibility verified.
+- 2026-11-03: Windows proposal documentation reviewed for scope, consistent
+  terminology and explicit unimplemented/unverified status. Relative links,
+  whitespace and private-path checks passed. Only documentation changed; runtime
+  tests were not rerun and no Windows validation was performed.
