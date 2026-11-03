@@ -2,7 +2,7 @@
 
 ## Current phase
 
-Standalone plugin package verified locally; publishing the first public version.
+First public package published and verified from a fresh GitHub clone.
 
 ## Done
 
@@ -28,15 +28,21 @@ Standalone plugin package verified locally; publishing the first public version.
 - Owner approved publication to `Kenne7hP/omarchy-agent-usage` on 2026-11-03.
 - Created the public repository at
   <https://github.com/Kenne7hP/omarchy-agent-usage>.
+- Published the 29-file package on `main`, retaining upstream attribution and
+  license notices.
+- Verified a fresh GitHub clone: all tracked bytes and executable modes matched
+  the source package; all 55 synthetic tests passed with zero skips. Native
+  plugin validation and Bash syntax checks also passed on the remote clone.
 
 ## In progress
 
-- Publishing the approved package to GitHub.
+- None.
 
 ## Todo
 
-- Upload and verify the public repository contents.
-- Verify native Git-based installation after a remote repository exists.
+- Verify full plugin enablement on an additional Omarchy installation. Remote
+  cloning and native package validation are verified; publication did not replace
+  the existing desktop plugin.
 
 ## Blockers and limits
 
@@ -52,4 +58,7 @@ Standalone plugin package verified locally; publishing the first public version.
 
 - 2026-11-03: 55 tests passed with zero skips in both the repository and a fresh
   temporary copy. Native manifest validation, Bash/Python syntax, package scan
-  and source-integrity checks passed. No installation or public upload performed.
+  and source-integrity checks passed.
+- 2026-11-03: published package commit `9f5ae34` independently cloned from GitHub;
+  all 29 tracked files and executable modes matched. All 55 tests, native plugin
+  validation and Bash syntax checks passed. Public repository visibility verified.
